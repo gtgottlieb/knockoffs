@@ -15,12 +15,10 @@ if (interactive()) {
 suppressPackageStartupMessages(library(glmnet))
 suppressPackageStartupMessages(library(knockoff))
 suppressPackageStartupMessages(library(tidyverse))
-suppressPackageStartupMessages(library(xgboost))
-
 source("../utils/utils.R")
 
 ## The directory to save the results
-save_dir <- sprintf("../results/simulation_nonlinear")
+save_dir <- sprintf("../results/simulation_linear")
 if(!dir.exists(save_dir)){
   dir.create(save_dir)
 }
@@ -41,37 +39,18 @@ beta_true <- rep(0, p)
 beta_true[nonzero] <- rnorm(k, amp / 10, 1) / sqrt(n)
 beta_true[sign_loc] <- -beta_true[sign_loc] 
 
-#y.gen <- function(X){               # mildly non-linear
-#  g <- X[,nonzero]%*%rep(0.8,k) +
-#    rowSums((X[,nonzero]**2)/2) +
-#    rnorm(n)
-#  drop(g)
-#}
-
-## --- new response generator --------------------------------
-y.gen <- function(X, beta_lin){
-  g <- X %*% beta_lin +                # linear part now carries amp
-    rowSums((X[, nonzero]^2) / 2) + # quadratic term unchanged
-    rnorm(n)
-  drop(g)
-}
-
+y.sample <- function(X) X %*% beta_true + rnorm(n)
 set <- data.frame(vkn = rep(0,p), mkn = rep(0,p), truth = beta_true)
 diags <- knockoff::create.solve_asdp(Sigma)
 nrep <- 20
 all_res <- data.frame()
-
-## Generating data
-set.seed(seedA)
-X <- matrix(rnorm(n * p),n) %*% chol(Sigma)
-Y <- y.gen(X, beta_true)
 
 ## ------------------------------------------------------------
 ##  Gradient-boosting antisymmetric statistic
 ## ------------------------------------------------------------
 stat.xgb_gain_diff <- function(X, Xk, y,
                                family  = c("gaussian", "binomial"),
-                               nrounds = 1500) {
+                               nrounds = 1460) {
   family <- match.arg(family)
   p      <- ncol(X)
   Xall   <- cbind(X, Xk)
@@ -81,9 +60,9 @@ stat.xgb_gain_diff <- function(X, Xk, y,
   params <- list(
     objective = if (family == "gaussian") "reg:squarederror"
     else "binary:logistic",
-    max_depth = 1, eta = 0.2,
-    subsample = 1, colsample_bytree = 1,
-    nthread   = 12, verbosity = 0, min_child_weight = 10, gamma = 10)
+    max_depth = 10, eta = 0.02,
+    subsample = 0.4, colsample_bytree = 0.4,
+    nthread   = 12, verbosity = 0, min_child_weight = 13.92, gamma = 2.45)
   set.seed(1)
   bst <- xgb.train(params, D, nrounds = nrounds, verbose = 0)
   
@@ -95,13 +74,18 @@ stat.xgb_gain_diff <- function(X, Xk, y,
   gain[1:p] - gain[(p+1):(2*p)]
 }
 
-## Run the procedures for multiple runs
+## Generating data
+set.seed(seedA)
+X <- matrix(rnorm(n * p),n) %*% chol(Sigma)
+Y <- y.sample(X)
+
 seedB <- 1
+## Run the procedures for multiple runs
 for(seedB in 1:nrep){
   cat(sprintf("Running the %d-th rep.\n", seedB)) 
   xk_seed <- 100 + (seedA - 1) * nrep + seedB
   set.seed(xk_seed)
-  
+
   ## Vanilla  knockoff
   Xk <- create.gaussian(X, mu, Sigma, diag_s = diags)
   W <- stat.glmnet_coefdiff(X, Xk, Y)
@@ -110,9 +94,9 @@ for(seedB in 1:nrep){
   fdp <- sum(beta_true[rej]==0) / max(length(rej), 1)
   power <- sum(beta_true[rej]!=0) / k
   all_res <- rbind(all_res,
-                   data.frame(method = "vanilla", power = power, fdp = fdp, seedB = seedB))
+    data.frame(method = "vanilla", power = power, fdp = fdp, seedB = seedB))
   set$vkn[rej] <- set$vkn[rej] + 1
-  
+
   ## Compute knockoff e-values 
   res <- ekn(X, Y, M, alpha / 2, mu, Sigma, diags, "gaussian", offset = 1)
   E <- res$E
@@ -120,7 +104,7 @@ for(seedB in 1:nrep){
   fdp <- sum(beta_true[rej]==0) / max(length(rej), 1)
   power <- sum(beta_true[rej]!=0) / k
   all_res <- rbind(all_res,
-                   data.frame(method = "multiple", power = power, fdp = fdp, seedB = seedB))
+    data.frame(method = "multiple", power = power, fdp = fdp, seedB = seedB))
   set$mkn[rej] <- set$mkn[rej] + 1
   
   ## 3. --- vanilla XGBoost knockoff -------------------------
@@ -133,19 +117,6 @@ for(seedB in 1:nrep){
                    data.frame(method = "vanilla_xgb", power = power, fdp = fdp, seedB = seedB))
   
   set$vxgb[rej] <- set$vxgb[rej] + 1
-  
-  ## 4. --- derandomised XGBoost knockoff --------------------
-  stat_mat <- kn_stat(X, Y, M, mu, Sigma, diags,
-                      stat_method = stat.xgb_gain_diff,
-                      family = "gaussian")
-  E <- kn_evals(stat_mat, gamma = alpha/2, offset = 1)
-  rej <- ebh(E, alpha)$rej
-  fdp <- sum(beta_true[rej]==0) / max(length(rej), 1)
-  power <- sum(beta_true[rej]!=0) / k
-  all_res <- rbind(all_res,
-                   data.frame(method = "multiple_xgb", power = power, fdp = fdp, seedB = seedB))
-  
-  set$mxgb[rej] <- set$mxgb[rej] + 1
 }
 
 out_dir <- sprintf("%s/res_amp_%d_seedA_%d.csv", save_dir, amp, seedA)
@@ -153,3 +124,4 @@ write_csv(all_res, out_dir)
 
 out_dir <- sprintf("%s/res_amp_%d_seedA_%d_set.csv", save_dir, amp, seedA)
 write_csv(set, out_dir)
+
